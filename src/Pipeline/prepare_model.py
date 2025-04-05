@@ -1,5 +1,6 @@
 import torch
 from diffusers.models.attention_processor import XFormersAttnProcessor
+from bitsandbytes.optim import Adam8bit
 
 from ..Networks.XFormersProcessor import AllToFirstXFormersAttnProcessor
 from ..Networks.DragSpatioModel import UNetDragSpatioTemporalConditionModel
@@ -8,7 +9,7 @@ from ..config import cfg
 
 def prepare_model():
     model = UNetDragSpatioTemporalConditionModel.from_pretrained(
-        cfg.pretrained_model,
+        pretrained_model_name_or_local_dir=cfg.pretrained_model,
         subfolder="unet",
         low_cpu_mem_usage=False,
         device_map=None,
@@ -109,4 +110,6 @@ def prepare_model():
             attn_processors_dict[key] = model_attn_processor_dict[key]
     model.set_attn_processor(attn_processors_dict)
 
-    return model
+    opt = Adam8bit(model.parameters(), lr=cfg.learning_rate, weight_decay=0, eps=1e-4)
+    
+    return model, opt

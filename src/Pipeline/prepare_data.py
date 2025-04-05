@@ -4,6 +4,12 @@ from ..dataset import DragVideoDataset
 from ..config import cfg
 
 
+def get_generator(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def prepare_data():
     dataset_train = DragVideoDataset(
         h5_path=cfg.h5_path,
@@ -38,4 +44,9 @@ def prepare_data():
         shuffle=True,
     )
 
-    return loader, val_loader
+    if cfg.main_process:
+        val_generator = get_generator(val_loader)
+    else:
+        val_generator = None
+
+    return loader, val_loader, val_generator

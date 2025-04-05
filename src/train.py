@@ -2,6 +2,7 @@ import os
 from Pipeline.mk_res_dir import mk_res_dir
 from Pipeline.prepare_model import prepare_model
 from Pipeline.prepare_data import prepare_data
+from Pipeline.prepare_vae import prepare_vae
 from Utils.logger import create_logger
 from Utils.seed import set_seed
 from config import cfg
@@ -41,10 +42,10 @@ def train():
     train_steps = 0 if cfg.resume_checkpoint is None else int(os.path.basename(cfg.resume_checkpoint).split('-')[0])
     logger.info(f"Resuming training from step {train_steps}" if cfg.resume_checkpoint else "Starting training from scratch")
 
-    model = prepare_model()
+    model, opt = prepare_model()
 
     logger.info("Model loaded")
     logger.info(f"UNet Parameters: Trainable {sum(p.numel() for p in model.parameters() if p.requires_grad):,} / {sum(p.numel() for p in model.parameters()):,}")
 
-    loder, val_loader = prepare_data()
-    
+    loder, val_loader, val_generator = prepare_data()    
+    image_processor, vae, scheduler = prepare_vae()
