@@ -1,7 +1,44 @@
+import os
+from Pipeline.mk_res_dir import mk_res_dir
+from Utils.logger import create_logger
+from Utils.seed import set_seed
+from config import cfg
 import torch
 from diffusers.utils.import_utils import is_xformers_available
+import torch.distributed
+import wandb
 
 
 def train():
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     assert is_xformers_available(), "XFormers is required for training."
+
+    if cfg.random_seed is not None:
+        set_seed(cfg.random_seed)
+
+    if cfg.distributed:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        is_main_process = local_rank == 0
+    else:
+        device = torch.cuda.current_device()
+        is_main_process = True
+        local_rank = 0
+
+    if is_main_process:
+        experiment_dir, checkpoint_dir, samples_dir = mk_res_dir()
+
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory created at {experiment_dir}")
+
+        if cfg.use_wandb:
+            wandb.init(
+                project="Skel4D",
+                name=os.path.basename(experiment_dir),
+            )
+    else:
+        logger = create_logger(None)

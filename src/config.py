@@ -1,3 +1,9 @@
+import os
+import torch
+import torch.distributed
+import yaml
+
+
 class SkelConf:
     def __init__(self):
         self.pretrained_model = "stabilityai/stable-video-diffusion-img2vid"
@@ -35,3 +41,14 @@ class SkelConf:
         self.non_first_frame_weight = 1.0
         self.weight_increasing = True
         self.max_grad_norm = 5.0
+
+        self.distributed = torch.cuda.device_count() > 1 and "RANK" in os.environ
+        self.global_rank = torch.distributed.get_rank() if self.distributed else None
+        self.world_size = torch.distributed.get_world_size() if self.distributed else 1
+
+    def save(self, filepath):
+        with open(filepath, 'w') as file:
+            yaml.dump(self.__dict__, file)
+
+
+cfg = SkelConf()
