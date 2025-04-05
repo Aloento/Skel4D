@@ -1,3 +1,4 @@
+from logging import Logger
 from torch.utils.data import DataLoader, DistributedSampler
 
 from ..dataset import DragVideoDataset
@@ -10,7 +11,7 @@ def get_generator(loader):
             yield batch
 
 
-def prepare_data():
+def prepare_data(logger: Logger):
     dataset_train = DragVideoDataset(
         h5_path=cfg.h5_path,
         num_max_drags=cfg.num_max_drags,
@@ -48,5 +49,7 @@ def prepare_data():
         val_generator = get_generator(val_loader)
     else:
         val_generator = None
+    
+    logger.info(f"Dataset contains {len(dataset_train):,} different (category, object, action) tuples.")
 
     return loader, val_loader, val_generator

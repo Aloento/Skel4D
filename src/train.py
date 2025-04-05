@@ -1,4 +1,5 @@
 import os
+from time import time
 from Pipeline.mk_res_dir import mk_res_dir
 from Pipeline.prepare_model import prepare_model
 from Pipeline.prepare_data import prepare_data
@@ -25,7 +26,10 @@ def train():
             torch.distributed.init_process_group(backend="nccl")
 
         torch.cuda.set_device(cfg.local_rank)
-
+        device = torch.device(f"cuda:{cfg.local_rank}")
+    else:
+        device = torch.device("cuda")
+        
     if cfg.main_process:
         experiment_dir, checkpoint_dir, samples_dir = mk_res_dir()
 
@@ -40,11 +44,17 @@ def train():
     else:
         logger = create_logger(None)
 
-    model, opt = prepare_model()
-    train_steps = resume_checkpoint(model, logger)
+    model, opt = prepare_model(device)
+    train_steps, model = resume_checkpoint(model, logger)
 
     logger.info("Model loaded")
     logger.info(f"UNet Parameters: Trainable {sum(p.numel() for p in model.parameters() if p.requires_grad):,} / {sum(p.numel() for p in model.parameters()):,}")
 
-    loder, val_loader, val_generator = prepare_data()    
+    loder, val_loader, val_generator = prepare_data(logger)    
     image_processor, vae, scheduler = prepare_vae()
+
+    log_steps = 0
+    running_loss = 0
+    start_time = time()
+
+    logger.info(f"Training for {cfg.num_steps} steps...")

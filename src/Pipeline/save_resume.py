@@ -1,12 +1,13 @@
 from logging import Logger
 import os
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from ..config import cfg
 
 
 def save_checkpoint(
-        model: torch.nn.Module | torch.nn.parallel.DistributedDataParallel,
+        model: torch.nn.Module | DistributedDataParallel,
         checkpoint_dir: str,
         train_steps: int
 ):
@@ -19,6 +20,7 @@ def save_checkpoint(
 def resume_checkpoint(
         model: torch.nn.Module,
         logger: Logger,
+        device: torch.device,
 ):
     train_steps = 0 if cfg.resume_checkpoint is None else int(os.path.basename(cfg.resume_checkpoint).split('-')[0])
     logger.info(f"Resuming training from step {train_steps}" if cfg.resume_checkpoint else "Starting training from scratch")
@@ -27,4 +29,13 @@ def resume_checkpoint(
         model.load_state_dict(torch.load(cfg.resume_checkpoint, map_location="cpu"), strict=False)
         logger.info(f"Checkpoint loaded from {cfg.resume_checkpoint}")
 
-    return train_steps
+    model = model.to(device)
+    if cfg.distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[cfg.local_rank],
+            output_device=cfg.local_rank,
+            find_unused_parameters=False,
+        )
+
+    return train_steps, model

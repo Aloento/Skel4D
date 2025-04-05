@@ -46,7 +46,6 @@ class SkelConf:
         self.global_rank = torch.distributed.get_rank() if self.distributed else None
         self.world_size = torch.distributed.get_world_size() if self.distributed else 1
         self.local_rank = int(os.environ["LOCAL_RANK"]) if self.distributed else 0
-        self.device = torch.device(f"cuda:{self.local_rank}") if self.distributed else torch.device("cuda")
         self.main_process = self.local_rank == 0
 
     def save(self, filepath):
