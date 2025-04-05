@@ -25,7 +25,7 @@ class SkelConf:
         self.log_every = 50
         self.visualize_every = 300
         self.ckpt_every = 600
-        self.use_wandb = True
+        self.use_wandb = False
 
         self.log_sigma_std = 1.6
         self.log_sigma_mean = 0.7

@@ -1,5 +1,4 @@
-from src.Networks.DragSpatioModel import UNetDragSpatioTemporalConditionModel
+from src.train import train
 
 
-skel4d = UNetDragSpatioTemporalConditionModel(num_drags=5)
-print(skel4d)
+train()

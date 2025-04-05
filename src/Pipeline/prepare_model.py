@@ -9,11 +9,11 @@ from ..config import cfg
 
 def prepare_model():
     model = UNetDragSpatioTemporalConditionModel.from_pretrained(
-        pretrained_model_name_or_local_dir=cfg.pretrained_model,
+        pretrained_model_name_or_path=cfg.pretrained_model,
         subfolder="unet",
         low_cpu_mem_usage=False,
         device_map=None,
-        num_drags=cfg.num_drags,
+        num_drags=cfg.num_max_drags,
         variant="fp16",
         torch_dtype=torch.float16,
 

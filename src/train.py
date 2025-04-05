@@ -1,13 +1,13 @@
 import os
 from time import time
-from Pipeline.mk_res_dir import mk_res_dir
-from Pipeline.prepare_model import prepare_model
-from Pipeline.prepare_data import prepare_data
-from Pipeline.prepare_vae import prepare_vae
-from Pipeline.save_resume import resume_checkpoint
-from Utils.logger import create_logger
-from Utils.seed import set_seed
-from config import cfg
+from .Pipeline.mk_res_dir import mk_res_dir
+from .Pipeline.prepare_model import prepare_model
+from .Pipeline.prepare_data import prepare_data
+from .Pipeline.prepare_vae import prepare_vae
+from .Pipeline.save_resume import resume_checkpoint
+from .Utils.logger import create_logger
+from .Utils.seed import set_seed
+from .config import cfg
 import torch
 from diffusers.utils.import_utils import is_xformers_available
 import torch.distributed
@@ -44,8 +44,8 @@ def train():
     else:
         logger = create_logger(None)
 
-    model, opt = prepare_model(device)
-    train_steps, model = resume_checkpoint(model, logger)
+    model, opt = prepare_model()
+    train_steps, model = resume_checkpoint(model, logger, device)
 
     logger.info("Model loaded")
     logger.info(f"UNet Parameters: Trainable {sum(p.numel() for p in model.parameters() if p.requires_grad):,} / {sum(p.numel() for p in model.parameters()):,}")

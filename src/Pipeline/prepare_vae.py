@@ -11,7 +11,7 @@ def prepare_vae():
 
     if cfg.main_process:
         vae = AutoencoderKLTemporalDecoder.from_pretrained(
-            pretrained_model_name_or_local_dir=cfg.pretrained_model,
+            pretrained_model_name_or_path=cfg.pretrained_model,
             subfolder="vae",
             torch_dtype=torch.float16,
             variant="fp16",
@@ -20,7 +20,7 @@ def prepare_vae():
         vae.eval()
 
         scheduler = EulerDiscreteScheduler.from_pretrained(
-            pretrained_model_name_or_local_dir=cfg.pretrained_model,
+            pretrained_model_name_or_path=cfg.pretrained_model,
             subfolder="scheduler",
         )  # type: EulerDiscreteScheduler
     else:
