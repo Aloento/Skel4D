@@ -1,6 +1,7 @@
 import os
 from time import time
 
+from .Pipeline.visualize_epoch import visualize_epoch
 from .Pipeline.log_epoch import log_epoch
 from .Pipeline.train_epoch import train_epoch
 from .Pipeline.mk_res_dir import mk_res_dir
@@ -54,7 +55,7 @@ def train():
     logger.info("Model loaded")
     logger.info(f"UNet Parameters: Trainable {sum(p.numel() for p in model.parameters() if p.requires_grad):,} / {sum(p.numel() for p in model.parameters()):,}")
 
-    loder, val_loader, val_generator = prepare_data(logger)    
+    loder, val_generator = prepare_data(logger)    
     image_processor, vae, scheduler = prepare_vae()
 
     log_steps = 0
@@ -103,10 +104,32 @@ def train():
 
             del loss, global_nan
 
-            if train_steps % cfg.ckpt_every == 0 and train_steps > 0:
-                save_checkpoint(
-                    model,
-                    checkpoint_dir,
-                    train_steps
-                )
+            save_checkpoint(
+                model,
+                checkpoint_dir,
+                train_steps
+            )
             
+            visualize_epoch(
+                train_steps,
+                model,
+                val_generator,
+                scheduler,
+                device,
+                vae,
+                image_processor,
+                samples_dir,
+                log_dict
+            )
+
+            if cfg.main_process and cfg.use_wandb:
+                wandb.log(log_dict)
+
+            if train_steps >= cfg.num_steps:
+                break
+        
+        if train_steps >= cfg.num_steps:
+            break
+
+    model.eval()
+    logger.info("Training finished.")

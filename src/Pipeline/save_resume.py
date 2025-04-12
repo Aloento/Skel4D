@@ -12,6 +12,9 @@ def save_checkpoint(
         checkpoint_dir: str,
         train_steps: int
 ):
+    if train_steps % cfg.ckpt_every != 0 or train_steps == 0:
+        return
+
     if cfg.main_process:
         if cfg.distributed:
             torch.save(model.module.state_dict(), f"{checkpoint_dir}/{train_steps:07d}.pt")

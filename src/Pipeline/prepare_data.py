@@ -52,4 +52,4 @@ def prepare_data(logger: Logger):
     
     logger.info(f"Dataset contains {len(dataset_train):,} different (category, object, action) tuples.")
 
-    return loader, val_loader, val_generator
+    return loader, val_generator
