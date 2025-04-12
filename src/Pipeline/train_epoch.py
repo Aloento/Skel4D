@@ -35,8 +35,8 @@ def train_epoch(
     noised_sample = sample + sigmas * noise
 
     model_output = model(noised_sample, timesteps, **model_kwargs)
-    target = sample
     pred = model_output * (-sigmas / (sigmas ** 2 + 1) ** 0.5) + noised_sample / (sigmas ** 2 + 1)
+    
     loss_weighting = 1 + 1 / sigmas ** 2
     loss_weighting = loss_weighting.repeat(1, 14, 1, 1, 1)
 
@@ -45,11 +45,12 @@ def train_epoch(
     elif cfg.non_first_frame_weight > 1:
         loss_weighting[:, 1:] = loss_weighting[:, 1:] * cfg.non_first_frame_weight
     
-    loss = (loss_weighting * torch.nan_to_num((target * 10.0 - pred * 10.0) ** 2, nan=0.0)).mean()
+    loss = (loss_weighting * torch.nan_to_num((sample * 10.0 - pred * 10.0) ** 2, nan=0.0)).mean()
     is_nan = torch.tensor(1.0 if torch.isnan(loss) or loss.item() < 0 else 0.0, device=device)
     
     if cfg.distributed:
         torch.distributed.all_reduce(is_nan, op=torch.distributed.ReduceOp.SUM)
     
     global_nan = is_nan.item()
+    del is_nan, loss_weighting, noise, noised_sample, pred, model_output, sample, cond_latent, encoder_hidden_states, drags, log_sigmas, timesteps, sigmas, model_kwargs
     return loss, global_nan

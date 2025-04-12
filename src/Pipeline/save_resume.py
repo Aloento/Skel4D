@@ -1,6 +1,7 @@
 from logging import Logger
 import os
 import torch
+import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 
 from ..config import cfg
@@ -11,10 +12,13 @@ def save_checkpoint(
         checkpoint_dir: str,
         train_steps: int
 ):
-    if cfg.distributed:
-        torch.save(model.module.state_dict(), f"{checkpoint_dir}/{train_steps:07d}.pt")
-    else:
-        torch.save(model.state_dict(), f"{checkpoint_dir}/{train_steps:07d}.pt")
+    if cfg.main_process:
+        if cfg.distributed:
+            torch.save(model.module.state_dict(), f"{checkpoint_dir}/{train_steps:07d}.pt")
+        else:
+            torch.save(model.state_dict(), f"{checkpoint_dir}/{train_steps:07d}.pt")
+    elif cfg.distributed:
+        torch.distributed.barrier()
         
 
 def resume_checkpoint(
