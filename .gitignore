@@ -5,3 +5,4 @@ runs/
 *.sif
 *.h5
 data/
+.ipynb_checkpoints
