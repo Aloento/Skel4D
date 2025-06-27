@@ -1,6 +1,6 @@
 # Import the modules
-from .api import StableKeypoints
-from .config import Config
+from StableKeypoints.api import StableKeypoints
+from StableKeypoints.config import Config
 
 def main():
     # Configure parameters
