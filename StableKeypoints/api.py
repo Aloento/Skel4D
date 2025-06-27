@@ -5,6 +5,7 @@ Main API for StableKeypoints
 from .config import Config
 from .models.model_loader import load_ldm
 from .optimization.optimizer import optimize_embedding, find_best_indices
+from .optimization.checkpoint import list_checkpoints, find_latest_checkpoint, load_checkpoint
 from .utils.gif_utils import create_gif
 from .utils.csv_utils import save_keypoints_to_csv
 from .utils.keypoint_extraction import extract_keypoints
@@ -67,6 +68,7 @@ class StableKeypoints:
             from_where=self.config.FROM_WHERE,
             layers=self.config.LAYERS,
             noise_level=self.config.NOISE_LEVEL,
+            config=self.config,
         )
         print("Embedding optimization completed!")
         return self

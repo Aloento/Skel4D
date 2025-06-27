@@ -41,3 +41,13 @@ class Config:
     
     # Default image directory
     IMAGE_DIR = "/home/c_capzw/c_cape3d/data/rendered/objaverse/66a62fc9ab97415f85b6322c103f8e1e/Take001"
+    
+    # Checkpoint settings
+    CHECKPOINT_DIR = "./checkpoints"
+    SAVE_CHECKPOINTS = True
+    CHECKPOINT_SAVE_INTERVAL = 500  # Save checkpoint every N steps
+    
+    # Resume/Load settings
+    LOAD_FROM_CHECKPOINT = False
+    CHECKPOINT_PATH = None  # Path to specific checkpoint to load
+    CONTINUE_TRAINING = False  # If True, continue training from checkpoint; if False, just use the embedding

@@ -11,6 +11,7 @@ from ..data.transforms import RandomAffineWithInverse
 from ..utils.image_utils import init_random_noise, run_and_find_attn
 from ..utils.keypoint_utils import find_top_k_gaussian, furthest_point_sampling
 from .losses import sharpening_loss, equivariance_loss
+from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
 
 def optimize_embedding(
@@ -40,15 +41,17 @@ def optimize_embedding(
     controllers=None,
     validation=False,
     num_subjects=1,
+    config=None,
 ):
     """
     Optimize context embedding for keypoint detection
     
     Args:
         ldm: Loaded diffusion model
-        context: Initial context embedding (if None, creates random)
+        context: Initial context embedding (if None, creates random or loads from checkpoint)
         device: Device to run optimization on
         num_steps: Number of optimization steps
+        config: Configuration object containing checkpoint settings
         ... (other parameters)
         
     Returns:
@@ -63,6 +66,32 @@ def optimize_embedding(
         translate=augment_translate,
     )
 
+    # Handle checkpoint loading and context initialization
+    start_step = 0
+    optimizer_state = None
+    
+    if config and config.LOAD_FROM_CHECKPOINT:
+        checkpoint_path = config.CHECKPOINT_PATH
+        if checkpoint_path is None:
+            # Try to find latest checkpoint
+            checkpoint_path = find_latest_checkpoint(config.CHECKPOINT_DIR)
+        
+        if checkpoint_path and checkpoint_path != "":
+            try:
+                checkpoint_data = load_checkpoint(checkpoint_path, device)
+                context = checkpoint_data['embedding']
+                if config.CONTINUE_TRAINING:
+                    start_step = checkpoint_data.get('step', 0)
+                    optimizer_state = checkpoint_data.get('optimizer_state')
+                    print(f"Resuming training from step {start_step}")
+                else:
+                    print("Loaded embedding from checkpoint (not continuing training)")
+                    return context.detach()
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}")
+                print("Starting with random embedding...")
+                context = None
+
     if context is None:
         context = init_random_noise(device, num_words=num_tokens)
 
@@ -70,6 +99,15 @@ def optimize_embedding(
 
     # optimize context to maximize attention at pixel_loc
     optimizer = torch.optim.Adam([context], lr=lr)
+    
+    # Load optimizer state if resuming training
+    if optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state)
+            print("Loaded optimizer state from checkpoint")
+        except Exception as e:
+            print(f"Could not load optimizer state: {e}")
+            print("Starting with fresh optimizer")
 
     start = time.time()
 
@@ -81,7 +119,7 @@ def optimize_embedding(
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=num_gpus, shuffle=True, drop_last=True)
     dataloader_iter = iter(dataloader)
 
-    for iteration in tqdm(range(int(num_steps*batch_size))):
+    for iteration in tqdm(range(start_step, int(num_steps*batch_size)), initial=start_step):
 
         try:
             mini_batch = next(dataloader_iter)
@@ -162,8 +200,38 @@ def optimize_embedding(
             running_equivariance_attn_loss = 0
             running_sharpening_loss = 0
             running_total_loss = 0
+            
+            # Save checkpoint if enabled
+            if (config and config.SAVE_CHECKPOINTS and 
+                (iteration + 1) % config.CHECKPOINT_SAVE_INTERVAL == 0):
+                try:
+                    save_checkpoint(
+                        embedding=context,
+                        optimizer_state=optimizer.state_dict(),
+                        step=iteration + 1,
+                        loss=loss.item() if torch.is_tensor(loss) else loss,
+                        config=config,
+                        checkpoint_dir=config.CHECKPOINT_DIR
+                    )
+                except Exception as e:
+                    print(f"Error saving checkpoint: {e}")
 
     print(f"optimization took {time.time() - start} seconds")
+    
+    # Save final checkpoint if enabled
+    if config and config.SAVE_CHECKPOINTS:
+        try:
+            final_checkpoint_path = save_checkpoint(
+                embedding=context,
+                optimizer_state=optimizer.state_dict(),
+                step=int(num_steps*batch_size),
+                loss=loss.item() if torch.is_tensor(loss) else loss,
+                config=config,
+                checkpoint_dir=config.CHECKPOINT_DIR
+            )
+            print(f"Final checkpoint saved: {final_checkpoint_path}")
+        except Exception as e:
+            print(f"Error saving final checkpoint: {e}")
 
     return context.detach()
 
