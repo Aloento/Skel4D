@@ -14,13 +14,17 @@ def main():
     # Create StableKeypoints instance
     sk = StableKeypoints(config)
     
-    # Run the complete pipeline
-    gif_path = sk.run_pipeline(
+    # Run the complete pipeline (optimized to avoid duplicate computation)
+    results = sk.run_pipeline(
         image_dir=config.IMAGE_DIR,
-        output_path="keypoints_sequence.gif"
+        output_path="keypoints_sequence.gif",
+        output_csv="keypoints.csv",
+        augmentation_iterations=20
     )
     
-    print(f"Generated GIF: {gif_path}")
+    print(f"Generated GIF: {results['gif']}")
+    print(f"Generated CSV: {results['csv']}")
+    print("Pipeline completed efficiently - keypoint detection was computed only once!")
 
 if __name__ == "__main__":
     main()

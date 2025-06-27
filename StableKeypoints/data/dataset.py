@@ -28,7 +28,12 @@ class CustomDataset(Dataset):
         img_path = os.path.join(self.data_root, self.image_files[idx])
         img = PILImage.open(img_path).convert('RGB')
         img = self.transform(img)
-        sample = {'img': img, 'kpts': torch.zeros(15, 2), 'visibility': torch.zeros(15)}
+        sample = {
+            'img': img, 
+            'kpts': torch.zeros(15, 2), 
+            'visibility': torch.zeros(15),
+            'name': self.image_files[idx]
+        }
         return sample
 
     def __len__(self):
