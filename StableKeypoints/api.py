@@ -2,16 +2,12 @@
 Main API for StableKeypoints
 """
 
-import csv
-import torch
 from .config import Config
 from .models.model_loader import load_ldm
 from .optimization.optimizer import optimize_embedding, find_best_indices
-from .utils.augmentation import run_image_with_context_augmented
-from .data.dataset import CustomDataset
-from .utils.keypoint_utils import find_max_pixel
 from .utils.gif_utils import create_gif
 from .utils.csv_utils import save_keypoints_to_csv
+from .utils.keypoint_extraction import extract_keypoints
 
 
 class StableKeypoints:
@@ -100,88 +96,26 @@ class StableKeypoints:
         print("Best indices found!")
         return self
     
-    def extract_keypoints(self, image_dir=None, augmentation_iterations=20):
-        """
-        Extract keypoint coordinates for all images.
-        
-        Args:
-            image_dir: Directory containing images (uses config default if None)
-            augmentation_iterations: Number of augmentation iterations for robust detection
-            
-        Returns:
-            List of dictionaries containing frame data: [{"frame_idx": int, "image_name": str, "img": tensor, "keypoints": array}, ...]
-        """
-        if self.embedding is None or self.indices is None:
-            raise ValueError("Embedding and indices not ready. Call optimize() and find_indices() first.")
-        
-        if image_dir is None:
-            image_dir = self.config.IMAGE_DIR
-        
-        dataset = CustomDataset(data_root=image_dir, image_size=512)
-        keypoints_data = []
-        
-        print(f"Extracting keypoints from {len(dataset)} images...")
-        
-        for frame_idx in range(len(dataset)):
-            # Get image
-            batch = dataset[frame_idx]
-            img = batch["img"]
-            image_name = batch.get("name", f"frame_{frame_idx:04d}")
-            
-            # Extract keypoints using the optimized embedding
-            maps = []
-            contexts = self.embedding if isinstance(self.embedding, list) else [self.embedding]
-            
-            for context in contexts:
-                map = run_image_with_context_augmented(
-                    self.ldm,
-                    img,
-                    context,
-                    self.indices.cpu(),
-                    device="cuda:0",
-                    from_where=self.config.FROM_WHERE,
-                    layers=self.config.LAYERS,
-                    noise_level=self.config.NOISE_LEVEL,
-                    augment_degrees=self.config.AUGMENT_DEGREES,
-                    augment_scale=self.config.AUGMENT_SCALE,
-                    augment_translate=self.config.AUGMENT_TRANSLATE,
-                    augmentation_iterations=augmentation_iterations,
-                    controllers=self.controllers,
-                    num_gpus=self.num_gpus,
-                    upsample_res=512,
-                )
-                maps.append(map)
-            
-            # Average maps if multiple contexts
-            maps = torch.stack(maps)
-            final_map = torch.mean(maps, dim=0)
-            
-            # Find keypoint coordinates
-            keypoints = find_max_pixel(final_map) / 512.0  # Normalize to [0,1]
-            keypoints = keypoints.cpu().numpy()
-            
-            # Store frame data
-            frame_data = {
-                "frame_idx": frame_idx,
-                "image_name": image_name,
-                "img": img,
-                "keypoints": keypoints
-            }
-            keypoints_data.append(frame_data)
-            
-            if frame_idx % 10 == 0:
-                print(f"Processed {frame_idx + 1}/{len(dataset)} images...")
-        
-        return keypoints_data
-    
     def run_pipeline(self, image_dir=None, output_path="keypoints_sequence.gif", output_csv="keypoints.csv", augmentation_iterations=20):
         """Run the complete pipeline with both GIF and CSV output"""
         self.load_model()
         self.optimize(image_dir)
         self.find_indices(image_dir)
         
-        # Extract keypoints data
-        keypoints_data = self.extract_keypoints(image_dir, augmentation_iterations)
+        if image_dir is None:
+            image_dir = self.config.IMAGE_DIR
+        
+        # Extract keypoints data using utils function
+        keypoints_data = extract_keypoints(
+            self.ldm,
+            self.embedding,
+            self.indices,
+            self.config,
+            image_dir,
+            self.controllers,
+            self.num_gpus,
+            augmentation_iterations
+        )
         
         # Save to CSV
         csv_path = save_keypoints_to_csv(keypoints_data, self.indices, output_csv)
