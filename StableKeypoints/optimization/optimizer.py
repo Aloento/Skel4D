@@ -294,6 +294,13 @@ def find_best_indices(
             top_embedding_indices = furthest_point_sampling(attention_map, top_k, top_initial_candidates)
 
             indices_list.append(top_embedding_indices.cpu())
+            
+            # Clean up GPU memory
+            del attention_map
+        
+        # Clean up attention_maps from GPU memory
+        del attention_maps
+        torch.cuda.empty_cache()
 
     # find the top_k most common indices
     indices_list = torch.cat([index for index in indices_list])

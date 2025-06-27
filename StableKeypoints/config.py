@@ -34,7 +34,7 @@ class Config:
     SIGMA = 1.0
     
     # Visualization settings
-    UPSAMPLE_RES = 512
+    UPSAMPLE_RES = 256
     AUGMENTATION_ITERATIONS = 10
     GIF_FPS = 5
     MAX_FRAMES = 100
@@ -48,6 +48,6 @@ class Config:
     CHECKPOINT_SAVE_INTERVAL = 500  # Save checkpoint every N steps
     
     # Resume/Load settings
-    LOAD_FROM_CHECKPOINT = False
-    CHECKPOINT_PATH = None  # Path to specific checkpoint to load
+    LOAD_FROM_CHECKPOINT = True
+    CHECKPOINT_PATH = "/home/c_capzw/notebooks/Skel4D/checkpoints/embedding_checkpoint_step_2000_20250627_130735.pt"  # Path to specific checkpoint to load
     CONTINUE_TRAINING = False  # If True, continue training from checkpoint; if False, just use the embedding

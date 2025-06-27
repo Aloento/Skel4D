@@ -98,10 +98,23 @@ def collect_maps(
 
         attention_maps_list.append(data)
 
-    attention_maps_list = torch.stack(attention_maps_list, dim=0).mean(dim=(0, 1))
+    # More memory-efficient way to compute mean
+    if len(attention_maps_list) > 0:
+        # Initialize result with first map
+        result = attention_maps_list[0].clone()
+        # Add remaining maps one by one
+        for i in range(1, len(attention_maps_list)):
+            result += attention_maps_list[i]
+        # Compute mean
+        result = result / len(attention_maps_list)
+        # Average across batch dimension
+        result = result.mean(dim=0)
+    else:
+        result = torch.tensor([])
+    
     controller.reset()
 
-    return attention_maps_list
+    return result
 
 
 def run_and_find_attn(
