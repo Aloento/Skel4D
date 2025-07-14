@@ -27,6 +27,13 @@ class Config:
     SHARPENING_LOSS_WEIGHT = 100
     EQUIVARIANCE_ATTN_LOSS_WEIGHT = 100
     
+    # Temporal consistency settings
+    TEMPORAL_CONSISTENCY_LOSS_WEIGHT = 10.0  # λ_temp parameter
+    TEMPORAL_LOSS_TYPE = "l2"  # "l2" or "kl"
+    TEMPORAL_FRAME_GAP = 1  # Gap between consecutive frames
+    USE_ADAPTIVE_TEMPORAL_LOSS = False  # Whether to use adaptive temporal loss
+    MOTION_THRESHOLD = 0.1  # Threshold for adaptive temporal loss
+    
     # Attention settings
     FROM_WHERE = ["down_cross", "mid_cross", "up_cross"]
     LAYERS = [0, 1, 2, 3, 4, 5]
