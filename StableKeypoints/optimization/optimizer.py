@@ -7,10 +7,11 @@ import torch
 from tqdm import tqdm
 
 from ..data.dataset import CustomDataset
+from ..data.temporal_dataset import TemporalDataset
 from ..data.transforms import RandomAffineWithInverse
 from ..utils.image_utils import init_random_noise, run_and_find_attn
 from ..utils.keypoint_utils import find_top_k_gaussian, furthest_point_sampling
-from .losses import sharpening_loss, equivariance_loss
+from .losses import sharpening_loss, equivariance_loss, temporal_consistency_loss, adaptive_temporal_loss
 from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
 
@@ -51,14 +52,26 @@ def optimize_embedding(
         context: Initial context embedding (if None, creates random or loads from checkpoint)
         device: Device to run optimization on
         num_steps: Number of optimization steps
-        config: Configuration object containing checkpoint settings
+        config: Configuration object containing checkpoint settings and temporal settings
         ... (other parameters)
         
     Returns:
         Optimized context embedding
     """
     
-    dataset = CustomDataset(data_root=dataset_loc, image_size=512)
+    # Choose dataset based on whether temporal consistency is enabled
+    use_temporal = config and config.TEMPORAL_CONSISTENCY_LOSS_WEIGHT > 0
+    
+    if use_temporal:
+        print("Using temporal dataset for temporal consistency training...")
+        dataset = TemporalDataset(
+            data_root=dataset_loc, 
+            image_size=512,
+            frame_gap=getattr(config, 'TEMPORAL_FRAME_GAP', 1)
+        )
+    else:
+        print("Using standard dataset...")
+        dataset = CustomDataset(data_root=dataset_loc, image_size=512)
 
     invertible_transform = RandomAffineWithInverse(
         degrees=augment_degrees,
@@ -113,10 +126,16 @@ def optimize_embedding(
 
     running_equivariance_attn_loss = 0
     running_sharpening_loss = 0
+    running_temporal_loss = 0
     running_total_loss = 0
 
     # create dataloader for the dataset
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=num_gpus, shuffle=True, drop_last=True)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=num_gpus, 
+        shuffle=True, 
+        drop_last=True
+    )
     dataloader_iter = iter(dataloader)
 
     for iteration in tqdm(range(start_step, int(num_steps*batch_size)), initial=start_step):
@@ -127,19 +146,59 @@ def optimize_embedding(
             dataloader_iter = iter(dataloader)
             mini_batch = next(dataloader_iter)
 
-        image = mini_batch["img"]
+        # Check if this is a temporal batch or single frame batch
+        # Check if this is temporal training
+        is_temporal_batch = use_temporal
 
-        attn_maps = run_and_find_attn(
-            ldm,
-            image,
-            context,
-            layers=layers,
-            noise_level=noise_level,
-            from_where=from_where,
-            upsample_res=-1,
-            device=device,
-            controllers=controllers,
-        )
+        if is_temporal_batch:
+            # Process temporal pair(s) - we always have temporal pairs in temporal dataset
+            frame_t = mini_batch["frame_t"]
+            frame_t1 = mini_batch["frame_t1"]
+            
+            # Get attention maps for both frames
+            attn_maps_t = run_and_find_attn(
+                ldm,
+                frame_t,
+                context,
+                layers=layers,
+                noise_level=noise_level,
+                from_where=from_where,
+                upsample_res=-1,
+                device=device,
+                controllers=controllers,
+            )
+            
+            attn_maps_t1 = run_and_find_attn(
+                ldm,
+                frame_t1,
+                context,
+                layers=layers,
+                noise_level=noise_level,
+                from_where=from_where,
+                upsample_res=-1,
+                device=device,
+                controllers=controllers,
+            )
+            
+            # Use frame_t for equivariance computation
+            image = frame_t
+            attn_maps = attn_maps_t
+        else:
+            # Process single frame (original behavior)
+            image = mini_batch["img"]
+            attn_maps = run_and_find_attn(
+                ldm,
+                image,
+                context,
+                layers=layers,
+                noise_level=noise_level,
+                from_where=from_where,
+                upsample_res=-1,
+                device=device,
+                controllers=controllers,
+            )
+            attn_maps_t = None
+            attn_maps_t1 = None
 
         transformed_img = invertible_transform(image)
 
@@ -157,6 +216,7 @@ def optimize_embedding(
 
         _sharpening_loss = []
         _loss_equivariance_attn = []
+        _temporal_loss = []
 
         for index, attn_map, attention_map_transformed in zip(torch.arange(num_gpus), attn_maps, attention_maps_transformed):
 
@@ -171,17 +231,49 @@ def optimize_embedding(
             _loss_equivariance_attn.append(equivariance_loss(
                 attn_map[top_embedding_indices], attention_map_transformed[top_embedding_indices][None].repeat(num_gpus, 1, 1, 1), invertible_transform, index
             ))
+            
+            # Compute temporal consistency loss if temporal data is available
+            current_sample_is_temporal = (
+                is_temporal_batch and 
+                attn_maps_t is not None and 
+                attn_maps_t1 is not None
+            )
+            
+            if current_sample_is_temporal:
+                attn_t_selected = attn_maps_t[index][top_embedding_indices]
+                attn_t1_selected = attn_maps_t1[index][top_embedding_indices]
+                
+                # Choose temporal loss type from config
+                temporal_loss_type = getattr(config, 'TEMPORAL_LOSS_TYPE', 'l2') if config else 'l2'
+                use_adaptive = getattr(config, 'USE_ADAPTIVE_TEMPORAL_LOSS', False) if config else False
+                
+                if use_adaptive:
+                    motion_threshold = getattr(config, 'MOTION_THRESHOLD', 0.1) if config else 0.1
+                    temp_loss = adaptive_temporal_loss(attn_t_selected, attn_t1_selected, motion_threshold)
+                else:
+                    temp_loss = temporal_consistency_loss(attn_t_selected, attn_t1_selected, temporal_loss_type)
+
+                _temporal_loss.append(temp_loss)
+            else:
+                # No temporal loss for single frame samples or when temporal data is not available
+                _temporal_loss.append(torch.tensor(0.0, device=device))
 
         _sharpening_loss = torch.stack([loss.to('cuda:0') for loss in _sharpening_loss]).mean()
         _loss_equivariance_attn = torch.stack([loss.to('cuda:0') for loss in _loss_equivariance_attn]).mean()
+        _temporal_loss = torch.stack([loss.to('cuda:0') for loss in _temporal_loss]).mean()
+        
+        # Get temporal loss weight from config
+        temporal_loss_weight = config.TEMPORAL_CONSISTENCY_LOSS_WEIGHT if config else 0.0
 
         loss = (
             + _loss_equivariance_attn * equivariance_attn_loss_weight
             + _sharpening_loss * sharpening_loss_weight
+            + _temporal_loss * temporal_loss_weight
         )
 
         running_equivariance_attn_loss += _loss_equivariance_attn / (batch_size//num_gpus) * equivariance_attn_loss_weight
         running_sharpening_loss += _sharpening_loss / (batch_size//num_gpus) * sharpening_loss_weight
+        running_temporal_loss += _temporal_loss / (batch_size//num_gpus) * temporal_loss_weight
         running_total_loss += loss / (batch_size//num_gpus)
 
         loss = loss / (batch_size//num_gpus)
@@ -189,9 +281,11 @@ def optimize_embedding(
         if iteration % 50 == 0:
             print(
                 f"loss: {loss.item()}, "
-                f"_loss_equivariance_attn: {running_equivariance_attn_loss.item()} "
-                f"sharpening_loss: {running_sharpening_loss.item()}, "
-                f"running_total_loss: {running_total_loss.item()}, "
+                f"equivariance: {running_equivariance_attn_loss.item():.4f}, "
+                f"sharpening: {running_sharpening_loss.item():.4f}, "
+                f"temporal: {running_temporal_loss.item():.4f}, "
+                f"total: {running_total_loss.item():.4f}, "
+                f"batch_type: {'temporal' if is_temporal_batch else 'single'}"
             )
         loss.backward()
         if (iteration + 1) % (batch_size//num_gpus) == 0:
@@ -199,6 +293,7 @@ def optimize_embedding(
             optimizer.zero_grad()
             running_equivariance_attn_loss = 0
             running_sharpening_loss = 0
+            running_temporal_loss = 0
             running_total_loss = 0
             
             # Save checkpoint if enabled
