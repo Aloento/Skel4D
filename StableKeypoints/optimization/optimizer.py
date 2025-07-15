@@ -6,6 +6,7 @@ import time
 import torch
 from tqdm import tqdm
 
+from ..config import Config
 from ..data.dataset import CustomDataset
 from ..data.temporal_dataset import TemporalDataset
 from ..data.transforms import RandomAffineWithInverse
@@ -42,7 +43,7 @@ def optimize_embedding(
     controllers=None,
     validation=False,
     num_subjects=1,
-    config=None,
+    config=None,  # type: Config
 ):
     """
     Optimize context embedding for keypoint detection
@@ -67,7 +68,7 @@ def optimize_embedding(
         dataset = TemporalDataset(
             data_root=dataset_loc, 
             image_size=512,
-            frame_gap=getattr(config, 'TEMPORAL_FRAME_GAP', 1)
+            frame_gap=config.TEMPORAL_FRAME_GAP
         )
     else:
         print("Using standard dataset...")
@@ -124,6 +125,20 @@ def optimize_embedding(
 
     start = time.time()
 
+    # Early stopping variables
+    early_stopping_enabled = config.EARLY_STOPPING_ENABLED if config else False
+    patience = config.EARLY_STOPPING_PATIENCE if config else 50
+    min_delta = config.EARLY_STOPPING_MIN_DELTA if config else 1e-4
+
+    best_loss = float('inf')
+    patience_counter = 0
+    early_stopped = False
+    
+    if early_stopping_enabled:
+        print(f"Early stopping enabled:")
+        print(f"  Patience: {patience} steps")
+        print(f"  Min delta: {min_delta}")
+
     running_equivariance_attn_loss = 0
     running_sharpening_loss = 0
     running_temporal_loss = 0
@@ -145,12 +160,8 @@ def optimize_embedding(
         except StopIteration:
             dataloader_iter = iter(dataloader)
             mini_batch = next(dataloader_iter)
-
-        # Check if this is a temporal batch or single frame batch
-        # Check if this is temporal training
-        is_temporal_batch = use_temporal
-
-        if is_temporal_batch:
+            
+        if use_temporal:
             # Process temporal pair(s) - we always have temporal pairs in temporal dataset
             frame_t = mini_batch["frame_t"]
             frame_t1 = mini_batch["frame_t1"]
@@ -234,7 +245,7 @@ def optimize_embedding(
             
             # Compute temporal consistency loss if temporal data is available
             current_sample_is_temporal = (
-                is_temporal_batch and 
+                use_temporal and 
                 attn_maps_t is not None and 
                 attn_maps_t1 is not None
             )
@@ -244,11 +255,11 @@ def optimize_embedding(
                 attn_t1_selected = attn_maps_t1[index][top_embedding_indices]
                 
                 # Choose temporal loss type from config
-                temporal_loss_type = getattr(config, 'TEMPORAL_LOSS_TYPE', 'l2') if config else 'l2'
-                use_adaptive = getattr(config, 'USE_ADAPTIVE_TEMPORAL_LOSS', False) if config else False
+                temporal_loss_type = config.TEMPORAL_LOSS_TYPE if config else 'l2'
+                use_adaptive = config.USE_ADAPTIVE_TEMPORAL_LOSS if config else False
                 
                 if use_adaptive:
-                    motion_threshold = getattr(config, 'MOTION_THRESHOLD', 0.1) if config else 0.1
+                    motion_threshold = config.MOTION_THRESHOLD if config else 0.1
                     temp_loss = adaptive_temporal_loss(attn_t_selected, attn_t1_selected, motion_threshold)
                 else:
                     temp_loss = temporal_consistency_loss(attn_t_selected, attn_t1_selected, temporal_loss_type)
@@ -284,8 +295,7 @@ def optimize_embedding(
                 f"equivariance: {running_equivariance_attn_loss.item():.4f}, "
                 f"sharpening: {running_sharpening_loss.item():.4f}, "
                 f"temporal: {running_temporal_loss.item():.4f}, "
-                f"total: {running_total_loss.item():.4f}, "
-                f"batch_type: {'temporal' if is_temporal_batch else 'single'}"
+                f"total: {running_total_loss.item():.4f}"
             )
         loss.backward()
         if (iteration + 1) % (batch_size//num_gpus) == 0:
@@ -310,6 +320,19 @@ def optimize_embedding(
                     )
                 except Exception as e:
                     print(f"Error saving checkpoint: {e}")
+
+        # Early stopping check
+        if early_stopping_enabled and not early_stopped:
+            if loss < best_loss - min_delta:
+                best_loss = loss
+                patience_counter = 0  # reset counter if we improved
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {iteration + 1} iterations")
+                early_stopped = True
+                break
 
     print(f"optimization took {time.time() - start} seconds")
     

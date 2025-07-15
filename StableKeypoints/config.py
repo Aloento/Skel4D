@@ -55,6 +55,18 @@ class Config:
     CHECKPOINT_SAVE_INTERVAL = 500  # Save checkpoint every N steps
     
     # Resume/Load settings
-    LOAD_FROM_CHECKPOINT = True
+    LOAD_FROM_CHECKPOINT = False
     CHECKPOINT_PATH = "/home/c_capzw/notebooks/Skel4D/checkpoints/embedding_checkpoint_step_2000_20250627_130735.pt"  # Path to specific checkpoint to load
     CONTINUE_TRAINING = False  # If True, continue training from checkpoint; if False, just use the embedding
+
+    # Staged training settings
+    STAGE2_STEPS = 500   # Steps for stage 2 (temporal consistency refinement)
+    STAGE2_TEMPORAL_WEIGHT = 50  # Temporal loss weight for stage 2
+    STAGE2_SHARPENING_WEIGHT = 50  # Reduced sharpening weight for stage 2
+    STAGE2_EQUIVARIANCE_WEIGHT = 50  # Reduced equivariance weight for stage 2
+
+    # Early stopping settings
+    EARLY_STOPPING_ENABLED = True  # Enable early stopping
+    EARLY_STOPPING_PATIENCE = 500   # Number of steps to wait for improvement
+    EARLY_STOPPING_MIN_DELTA = 1e-4  # Minimum improvement to consider
+  
