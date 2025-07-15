@@ -101,11 +101,7 @@ def temporal_consistency_loss(attn_t, attn_t1, loss_type="l2", mask=None):
         
         # Average over spatial dimensions and keypoints
         loss = loss.mean()
-        
-        # Scale the loss to make it more significant
-        # Temporal consistency loss should be in similar magnitude to other losses
-        loss = loss * 1000.0  # Scale factor to make temporal loss more prominent
-        
+
     elif loss_type == "kl":
         # KL divergence loss
         # Normalize attention maps to make them proper distributions
@@ -136,9 +132,6 @@ def temporal_consistency_loss(attn_t, attn_t1, loss_type="l2", mask=None):
         
         # Average over spatial dimensions and keypoints
         loss = loss.mean()
-        
-        # Scale the KL loss to make it more significant
-        loss = loss * 100.0  # Scale factor for KL divergence
         
     else:
         raise ValueError(f"Unsupported loss type: {loss_type}")

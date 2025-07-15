@@ -13,10 +13,10 @@ class Config:
     FURTHEST_POINT_NUM_SAMPLES = 15
     
     # Optimization settings
-    NUM_OPTIMIZATION_STEPS = 1000
-    BATCH_SIZE = 2
+    NUM_OPTIMIZATION_STEPS = 10000
+    BATCH_SIZE = 8
     LEARNING_RATE = 5e-3
-    NUM_TOKENS = 500
+    NUM_TOKENS = 1000
     
     # Augmentation settings
     AUGMENT_DEGREES = 30

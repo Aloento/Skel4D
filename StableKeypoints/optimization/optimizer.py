@@ -147,7 +147,9 @@ def optimize_embedding(
     # create dataloader for the dataset
     dataloader = torch.utils.data.DataLoader(
         dataset, 
-        batch_size=num_gpus, 
+        batch_size=num_gpus,
+        num_workers=num_gpus,
+        pin_memory=True,
         shuffle=True, 
         drop_last=True
     )
@@ -291,13 +293,14 @@ def optimize_embedding(
 
         if iteration % 50 == 0:
             print(
-                f"loss: {loss.item()}, "
-                f"equivariance: {running_equivariance_attn_loss.item():.4f}, "
-                f"sharpening: {running_sharpening_loss.item():.4f}, "
-                f"temporal: {running_temporal_loss.item():.4f}, "
-                f"total: {running_total_loss.item():.4f}"
+                f"loss: {loss.item() * 100}, "
+                f"equivariance: {running_equivariance_attn_loss.item() * 1000:.4f}, "
+                f"sharpening: {running_sharpening_loss.item() * 1000:.4f}, "
+                f"temporal: {running_temporal_loss.item() * 10000:.4f}, "
+                f"total: {running_total_loss.item() * 1000:.4f}"
             )
         loss.backward()
+
         if (iteration + 1) % (batch_size//num_gpus) == 0:
             optimizer.step()
             optimizer.zero_grad()
