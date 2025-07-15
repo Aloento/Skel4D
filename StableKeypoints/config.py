@@ -13,8 +13,8 @@ class Config:
     FURTHEST_POINT_NUM_SAMPLES = 15
     
     # Optimization settings
-    NUM_OPTIMIZATION_STEPS = 2000
-    BATCH_SIZE = 1
+    NUM_OPTIMIZATION_STEPS = 1000
+    BATCH_SIZE = 2
     LEARNING_RATE = 5e-3
     NUM_TOKENS = 500
     
@@ -52,7 +52,7 @@ class Config:
     # Checkpoint settings
     CHECKPOINT_DIR = "./checkpoints"
     SAVE_CHECKPOINTS = True
-    CHECKPOINT_SAVE_INTERVAL = 500  # Save checkpoint every N steps
+    CHECKPOINT_SAVE_INTERVAL = 2000  # Save checkpoint every N steps
     
     # Resume/Load settings
     LOAD_FROM_CHECKPOINT = False

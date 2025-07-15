@@ -253,7 +253,7 @@ class StagedTrainer:
         # Execute complete pipeline
         self.load_model()
         self.stage1_optimize(image_dir)
-        self.stage2_optimize(image_dir)
+        # self.stage2_optimize(image_dir)
         self.find_indices(image_dir)
         results = self.generate_outputs(image_dir, output_path, output_csv, augmentation_iterations)
         
@@ -311,15 +311,11 @@ def train_staged_temporal_consistency():
     
     # Configuration parameters
     config = Config()
-    config.BATCH_SIZE = 8
     config.IMAGE_DIR = "/home/c_capzw/c_cape3d/data/rendered/objaverse/66a62fc9ab97415f85b6322c103f8e1e/Take001"
     
     # Temporal settings
     config.TEMPORAL_FRAME_GAP = 3
     config.USE_ADAPTIVE_TEMPORAL_LOSS = True
-    
-    # Checkpoint settings
-    config.CHECKPOINT_SAVE_INTERVAL = 100
     
     print("Configuration:")
     print(f"  Stage 1 steps: {config.NUM_OPTIMIZATION_STEPS}")
