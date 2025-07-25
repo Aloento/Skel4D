@@ -16,7 +16,7 @@ class Config:
     NUM_OPTIMIZATION_STEPS = 10000
     BATCH_SIZE = 8
     LEARNING_RATE = 5e-3
-    NUM_TOKENS = 1000
+    NUM_TOKENS = 500
     
     # Augmentation settings
     AUGMENT_DEGREES = 30
