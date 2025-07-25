@@ -1,7 +1,7 @@
 import os
 import argparse
-from src.Utils.decode import decode_latents_and_save
-from src.dataset import DragVideoDataset
+from StableVideo.Utils.decode import decode_latents_and_save
+from StableVideo.dataset import DragVideoDataset
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader

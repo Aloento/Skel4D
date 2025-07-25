@@ -1,9 +1,15 @@
+"""
+Data transformation utilities
+"""
+
 import math
 import torch
 import torch.nn.functional as F
 
 
 class RandomAffineWithInverse:
+    """Random affine transformation with inverse capability"""
+    
     def __init__(
         self,
         degrees=0,
@@ -46,8 +52,6 @@ class RandomAffineWithInverse:
                 translations_percent = (
                     torch.rand(1).item() * (2 * self.translate[0]) - self.translate[0],
                     torch.rand(1).item() * (2 * self.translate[1]) - self.translate[1],
-                    # 1.0,
-                    # 1.0,
                 )
 
                 # Create the affine matrix
@@ -92,11 +96,14 @@ class RandomAffineWithInverse:
         return untransformed_img
 
 
-
 def return_theta(scale, pixel_loc, rotation_angle_degrees=0):
     """
-    Pixel_loc between 0 and 1
-    Rotation_angle_degrees between 0 and 360
+    Create affine transformation matrix
+    
+    Args:
+        scale: Scaling factor
+        pixel_loc: Pixel location between 0 and 1
+        rotation_angle_degrees: Rotation angle between 0 and 360
     """
 
     rescaled_loc = pixel_loc * 2 - 1

@@ -1,10 +1,17 @@
+"""
+Dataset handling for StableKeypoints
+"""
+
 import os
 import torch
+from PIL import Image as PILImage
 from torchvision import transforms
-from PIL import Image
 from torch.utils.data import Dataset
 
+
 class CustomDataset(Dataset):
+    """Custom dataset for loading images from a directory"""
+    
     def __init__(self, data_root, image_size):
         super().__init__()
         self.data_root = data_root
@@ -19,9 +26,14 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.data_root, self.image_files[idx])
-        img = Image.open(img_path).convert('RGB')
+        img = PILImage.open(img_path).convert('RGB')
         img = self.transform(img)
-        sample = {'img': img, 'kpts': torch.zeros(15, 2), 'visibility': torch.zeros(15)}
+        sample = {
+            'img': img, 
+            'kpts': torch.zeros(15, 2), 
+            'visibility': torch.zeros(15),
+            'name': self.image_files[idx]
+        }
         return sample
 
     def __len__(self):
