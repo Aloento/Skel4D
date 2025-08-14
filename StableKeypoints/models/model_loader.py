@@ -9,7 +9,7 @@ from diffusers import StableDiffusionPipeline, DDIMScheduler
 from .attention_control import AttentionStore, register_attention_control
 
 
-def load_ldm(device, model_type="runwayml/stable-diffusion-v1-5", feature_upsample_res=256):
+def load_ldm(device, model_type="stabilityai/stable-diffusion-2-1-base", feature_upsample_res=256):
     """
     Load and configure Stable Diffusion model with attention control
     

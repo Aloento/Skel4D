@@ -10,7 +10,7 @@ from PIL import Image as PILImage
 
 def init_random_noise(device, num_words=77):
     """Initialize random noise for context embedding"""
-    return torch.randn(1, num_words, 768).to(device)
+    return torch.randn(1, num_words, 1024).to(device)
 
 
 def image2latent(model, image, device):
@@ -100,13 +100,35 @@ def collect_maps(
 
     # More memory-efficient way to compute mean
     if len(attention_maps_list) > 0:
-        # Initialize result with first map
-        result = attention_maps_list[0].clone()
+        # Find the maximum size in each dimension across all attention maps
+        max_dims = [0, 0, 0, 0]  # [batch, channels, height, width]
+        for attn_map in attention_maps_list:
+            for i in range(len(attn_map.shape)):
+                max_dims[i] = max(max_dims[i], attn_map.shape[i])
+        
+        # Pad all attention maps to the same size
+        processed_maps = []
+        for attn_map in attention_maps_list:
+            # Calculate padding for each dimension
+            padding = []
+            for i in range(len(attn_map.shape) - 1, -1, -1):  # F.pad expects padding in reverse order
+                pad_size = max_dims[i] - attn_map.shape[i]
+                padding.extend([0, pad_size])
+            
+            # Apply padding
+            if any(p > 0 for p in padding):
+                padded_map = F.pad(attn_map, padding, mode='constant', value=0)
+            else:
+                padded_map = attn_map
+            processed_maps.append(padded_map)
+        
+        # Initialize result with first processed map
+        result = processed_maps[0].clone()
         # Add remaining maps one by one
-        for i in range(1, len(attention_maps_list)):
-            result += attention_maps_list[i]
+        for i in range(1, len(processed_maps)):
+            result += processed_maps[i]
         # Compute mean
-        result = result / len(attention_maps_list)
+        result = result / len(processed_maps)
         # Average across batch dimension
         result = result.mean(dim=0)
     else:

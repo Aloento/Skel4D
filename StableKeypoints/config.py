@@ -4,7 +4,7 @@ Configuration settings for StableKeypoints project
 
 class Config:
     # Model settings
-    STABLE_DIFFUSION_MODEL = "runwayml/stable-diffusion-v1-5"
+    STABLE_DIFFUSION_MODEL = "stabilityai/stable-diffusion-2-1-base"
     FEATURE_UPSAMPLE_RES = 128
     NUM_DDIM_STEPS = 50
     

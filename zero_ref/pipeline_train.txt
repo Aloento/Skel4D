@@ -1,0 +1,956 @@
+from typing import Any, Dict, Optional
+from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.schedulers import KarrasDiffusionSchedulers
+
+import numpy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint
+import torch.distributed
+import transformers
+from collections import OrderedDict
+from PIL import Image
+from torchvision import transforms
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
+
+import diffusers
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    DiffusionPipeline,
+    EulerAncestralDiscreteScheduler,
+    UNet2DConditionModel,
+    ImagePipelineOutput
+)
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.models.attention_processor import Attention, AttnProcessor, XFormersAttnProcessor, AttnProcessor2_0
+from diffusers.utils.import_utils import is_xformers_available
+
+# Import StableKeypoints loss utilities
+from src.utils.keypoint_losses import (
+    compute_stable_keypoints_losses,
+    find_top_k_gaussian_batch,
+    furthest_point_sampling_batch,
+    sharpening_loss_batch,
+    find_max_pixel_single,
+    gaussian_circles_single
+)
+
+
+def to_rgb_image(maybe_rgba: Image.Image):
+    if maybe_rgba.mode == 'RGB':
+        return maybe_rgba
+    elif maybe_rgba.mode == 'RGBA':
+        rgba = maybe_rgba
+        img = numpy.random.randint(255, 256, size=[rgba.size[1], rgba.size[0], 3], dtype=numpy.uint8)
+        img = Image.fromarray(img, 'RGB')
+        img.paste(rgba, mask=rgba.getchannel('A'))
+        return img
+    else:
+        raise ValueError("Unsupported image type.", maybe_rgba.mode)
+
+
+def reshape_and_tile(single_attns, grid_size=(2,3), single_res=(64,64), grid_res=(80,120)):
+    # single_attns is a list of 6 views, each with shape [batch_size, spatial_single, num_keypoint_tokens]
+    batch_size, HW_single, Tokens = single_attns[0].shape
+    H_single, W_single = single_res
+    H_grid, W_grid = grid_res
+
+    # Step 1: Resize each single-view attention to fit grid's sub-view region
+    resized_views = []
+    H_sub, W_sub = H_grid // grid_size[0], W_grid // grid_size[1]  # sub-region size in grid
+    for attn in single_attns:
+        attn_spatial = attn.view(batch_size, H_single, W_single, Tokens).permute(0,3,1,2)  # [batch_size, Tokens, H, W]
+        attn_resized = F.interpolate(attn_spatial, (H_sub, W_sub), mode='bilinear')  # [batch_size, Tokens, H_sub, W_sub]
+        resized_views.append(attn_resized)
+
+    # Step 2: Tile resized views into full-grid attention map
+    full_grid_attn = torch.zeros(batch_size, Tokens, H_grid, W_grid, device=single_attns[0].device)
+
+    positions = [(0,0),(0,1),(0,2),(1,0),(1,1),(1,2)]
+    for idx, (r, c) in enumerate(positions):
+        h_start, w_start = r*H_sub, c*W_sub
+        full_grid_attn[:,:,h_start:h_start+H_sub, w_start:w_start+W_sub] = resized_views[idx]
+
+    # Flatten back to attention shape
+    combined_attn = full_grid_attn.permute(0,2,3,1).reshape(batch_size, H_grid*W_grid, Tokens)
+
+    return combined_attn
+
+            
+class ReferenceOnlyAttnProc(torch.nn.Module):
+    def __init__(
+        self,
+        chained_proc,
+        self_att=False,
+        cross_att=False,
+        name=None
+    ) -> None:
+        super().__init__()
+        self.self_att = self_att
+        self.cross_att = cross_att
+        self.chained_proc = chained_proc
+        self.name = name
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        mode="w",
+        ref_dict: dict = None,
+        cross_att_ref_dict: Optional[Dict[str, Any]] = None,
+        is_cfg_guidance=False,
+        learnable_embeddings=None,
+        keypoint_guidance_strength=0.3,
+        keypoint_guidance_mode="enhanced"  # "simple", "enhanced", "multiplicative"  
+        ) -> Any:
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        if self.self_att and is_cfg_guidance:
+            res0 = self.chained_proc(attn, hidden_states[:1], encoder_hidden_states[:1], attention_mask)
+            hidden_states = hidden_states[1:]
+            encoder_hidden_states = encoder_hidden_states[1:]
+        
+        if self.self_att:
+            if mode == 'cw':
+                ref_dict[self.name] = [encoder_hidden_states]
+            elif mode == 'skw':
+                pass
+            elif mode == 'r':
+                encoder_hidden_states = torch.cat([encoder_hidden_states, ref_dict.pop(self.name)[0]], dim=1)
+            elif mode == 'm':
+                encoder_hidden_states = torch.cat([encoder_hidden_states, ref_dict[self.name][0]], dim=1)
+            else:
+                assert False, mode
+        elif self.cross_att:
+            if mode == 'skw':
+                # STABLEKEYPOINTS WRITE MODE: Use learnable embeddings for keypoint discovery
+                print(f"Using learnable embeddings in SK branch {self.name}: {learnable_embeddings.shape}")
+
+                # Compute attention components with keypoint embeddings
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(learnable_embeddings)
+                value = attn.to_v(learnable_embeddings)
+
+                print(f"Keypoint attention query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+                
+                # Reshape for attention computation
+                query = attn.head_to_batch_dim(query)
+                key = attn.head_to_batch_dim(key)
+                value = attn.head_to_batch_dim(value)
+                
+                # Compute attention scores - these will be optimized for keypoint localization
+                attention_probs = attn.get_attention_scores(query, key, attention_mask)
+                # Attention probs shape explanation: [30, 1600, 16] = [6_batch_size × 5_attention_heads, spatial_seq_len, num_keypoint_tokens]
+                # The 30 comes from head_to_batch_dim transformation: 6 views × 5 UNet attention heads = 30
+                print("Collecting keypoint attention maps for", self.name, 'encoder shape:', learnable_embeddings.shape, 
+                      'hidden shape:', hidden_states.shape, "Attention probs shape:", attention_probs.shape)
+                
+                # Store attention maps for later use and potential loss computation
+                cross_att_ref_dict[self.name] = attention_probs.detach()
+
+            elif mode == 'cw':
+                pass    
+            
+            elif mode == 'r':
+                # MAIN BRANCH: Apply keypoint guidance following original Zero123Plus pattern
+                stored_attention = cross_att_ref_dict.pop(self.name, None)
+                if stored_attention is not None:
+                    # Reconstruct 2x3 grid from individual view attention maps
+                    # stored_attention: [30, 1600, 16] = [6_views × 5_heads, spatial_tokens, keypoint_tokens]
+                    # This contains attention maps from SK branch that need to be converted back to 2x3 grid layout
+                    batch_views, spatial_single, num_keypoint_tokens = stored_attention.shape
+
+                    # Processing keypoint attention: [30, 1600, 16] where 30 = 1_batch × 6_views × 5_attention_heads
+                    # Each of the 6 views has been processed through variable attention heads independently
+                    print(f"Processing keypoint attention for {self.name}: {stored_attention.shape}")
+                    
+                    # Calculate dimensions dynamically from stored attention tensor
+                    batch_views, spatial_single, num_keypoint_tokens = stored_attention.shape
+                    num_views = 6  # Zero123Plus always processes 6 views
+                    
+                    # Read actual batch size from encoder_hidden_states
+                    batch_size = encoder_hidden_states.shape[0]
+                    
+                    # Calculate actual number of heads from tensor dimensions
+                    # batch_views = batch_size × num_views × num_heads
+                    num_heads = batch_views // (batch_size * num_views)  # Dynamic calculation: 30//(1*6)=5, 60//(1*6)=10, 120//(1*6)=20
+                    
+                    print(f"Dynamic head calculation: batch_views={batch_views}, num_heads={num_heads}, batch_size={batch_size}")
+                    
+                    # Determine spatial dimensions for individual views and 2x3 grid
+                    # spatial_single = 1600 tokens from 40x40 individual view -> sqrt(1600) = 40
+                    spatial_single_h = spatial_single_w = int(spatial_single ** 0.5)  # 40x40 per view
+                    
+                    # For 2x3 grid: height = 2*single_h, width = 3*single_w
+                    grid_h = 2 * spatial_single_h  # 2 rows -> 80 pixels
+                    grid_w = 3 * spatial_single_w  # 3 columns -> 120 pixels
+
+                    print(f"Grid dimensions for {self.name}: {grid_h}x{grid_w}")
+
+                    '''# Reconstructing: [30, 1600, 16] -> 2x3 grid (80x120) = 9600 total spatial tokens
+                    # Individual 40x40 views get tiled into 80x120 grid following Zero123Plus layout
+                    print(f"Reconstructing keypoint features for {self.name}: {stored_attention.shape} -> 2x3 grid ({grid_h}x{grid_w})")
+                    # print encoder_hidden_states shape
+                    print(f"Encoder hidden states shape: {encoder_hidden_states.shape}")
+                    
+                    # The stored_attention is [30, 1600, 16] = [1*6*5, spatial_single, num_keypoint_tokens]
+                    # We need to reshape to separate heads and views first: [1, 5, 6, spatial_single, num_keypoint_tokens]
+                    # Then average across attention heads to get: [1, 6, spatial_single, num_keypoint_tokens]
+                    attention_with_heads = stored_attention.view(batch_size, num_heads, num_views, spatial_single, num_keypoint_tokens)
+                    
+                    # Average across attention heads to consolidate multi-head attention into single representation
+                    attention_averaged = torch.mean(attention_with_heads, dim=1)  # [batch_size, num_views, spatial_single, num_keypoint_tokens]
+                    
+                    # Split into individual views for grid reconstruction
+                    single_attns = []
+                    for view_idx in range(num_views):
+                        view_attn = attention_averaged[:, view_idx, :, :]  # [batch_size, spatial_single, num_keypoint_tokens]
+                        single_attns.append(view_attn)
+                    
+                    # Use reshape_and_tile to reconstruct 2x3 grid attention
+                    grid_attention_keypoints = reshape_and_tile(
+                        single_attns, 
+                        grid_size=(2, 3), 
+                        single_res=(spatial_single_h, spatial_single_w),
+                        grid_res=(grid_h, grid_w)
+                    )  # [batch_size, grid_h*grid_w, num_keypoint_tokens]                    
+                    
+                    # Create keypoint-aware features following Zero123Plus concatenation pattern
+                    # Convert attention maps to feature representations
+                    # grid_attention_keypoints shape: [batch_size, grid_h*grid_w, num_keypoint_tokens] = [1, 9600, 16]
+                    batch_size_final, spatial_grid, num_keypoints = grid_attention_keypoints.shape
+
+                    print(f"Keypoint attention grid shape: {grid_attention_keypoints.shape} (batch_size={batch_size_final}, spatial_grid={spatial_grid}, num_keypoints={num_keypoints})")
+                    
+                    # APPLY KEYPOINT GUIDANCE: Blend normal Zero123Plus attention with keypoint attention
+                    # Compute normal cross-attention with text embeddings (Zero123Plus standard behavior)
+                    normal_query = attn.to_q(hidden_states)
+                    normal_key = attn.to_k(encoder_hidden_states)
+                    normal_value = attn.to_v(encoder_hidden_states)
+                    
+                    # Reshape for attention computation
+                    normal_query = attn.head_to_batch_dim(normal_query)
+                    normal_key = attn.head_to_batch_dim(normal_key)
+                    normal_value = attn.head_to_batch_dim(normal_value)
+                    
+                    # Compute normal attention scores
+                    normal_attention_probs = attn.get_attention_scores(normal_query, normal_key, attention_mask)
+                    
+                    # Convert keypoint attention to match normal attention dimensions
+                    # grid_attention_keypoints: [batch_size, spatial_grid, num_keypoints] = [1, 9600, 16]
+                    # normal_attention_probs: [batch_size * heads, spatial_sequence, text_tokens] = [5, 9600, 77]
+                    
+                    # Handle dimension mismatch between keypoint attention and normal attention
+                    batch_heads, spatial_seq, text_tokens = normal_attention_probs.shape
+                    heads_per_batch = batch_heads // batch_size_final
+                    
+                    if spatial_seq == spatial_grid and num_keypoints <= text_tokens:
+                        # Enhanced keypoint guidance: Use keypoint-specific attention instead of mean pooling
+                        # This preserves individual keypoint semantics rather than averaging them out
+                        
+                        # Apply keypoint guidance with configurable strength
+                        guidance_strength = keypoint_guidance_strength
+                        
+                        if keypoint_guidance_mode == "enhanced":
+                            # Option 1: Enhanced guidance with max pooling and attention sharpening
+                            if num_keypoints == 16:  # Standard StableKeypoints configuration
+                                # Use max pooling to preserve strongest keypoint activations
+                                spatial_guidance, _ = torch.max(grid_attention_keypoints, dim=-1, keepdim=True)  # [batch_size, spatial_grid, 1]
+                                
+                                # Apply spatial sharpening to enhance keypoint focus
+                                spatial_guidance = torch.pow(spatial_guidance, 2.0)  # Sharpen attention peaks
+                                spatial_guidance = spatial_guidance / (torch.sum(spatial_guidance, dim=1, keepdim=True) + 1e-8)  # Renormalize
+                            else:
+                                # Fallback to mean pooling for non-standard keypoint configurations
+                                spatial_guidance = torch.mean(grid_attention_keypoints, dim=-1, keepdim=True)
+                            
+                            # Expand spatial guidance to match normal attention dimensions
+                            spatial_guidance = spatial_guidance.repeat(heads_per_batch, 1, text_tokens)
+                            
+                            # Enhanced blending: Use multiplicative attention for stronger keypoint focus
+                            keypoint_mask = spatial_guidance > torch.quantile(spatial_guidance, 0.8)  # Top 20% keypoint regions
+                            enhanced_guidance = spatial_guidance * (1.0 + keypoint_mask.float() * guidance_strength)
+                            
+                            # Combine normal attention with enhanced keypoint guidance
+                            guided_attention_probs = normal_attention_probs * enhanced_guidance
+                            
+                        elif keypoint_guidance_mode == "multiplicative":
+                            # Option 2: Pure multiplicative guidance (stronger keypoint focus)
+                            spatial_guidance = torch.mean(grid_attention_keypoints, dim=-1, keepdim=True)
+                            spatial_guidance = spatial_guidance.repeat(heads_per_batch, 1, text_tokens)
+                            
+                            # Apply multiplicative guidance
+                            guided_attention_probs = normal_attention_probs * (1.0 + guidance_strength * spatial_guidance)
+                            
+                        else:  # "simple" mode (original implementation)
+                            # Option 3: Simple additive blending (original approach)
+                            spatial_guidance = torch.mean(grid_attention_keypoints, dim=-1, keepdim=True)
+                            spatial_guidance = spatial_guidance.repeat(heads_per_batch, 1, text_tokens)
+                            
+                            # Apply simple additive guidance
+                            guided_attention_probs = (1 - guidance_strength) * normal_attention_probs + guidance_strength * spatial_guidance
+                        
+                        # Normalize guided attention while preserving attention mass
+                        guided_attention_probs = torch.softmax(guided_attention_probs, dim=-1)
+                        
+                        print(f"Enhanced keypoint guidance applied ({keypoint_guidance_mode}):")
+                        print(f"  - Guidance strength: {guidance_strength}")
+                        print(f"  - Keypoint attention range: [{torch.min(grid_attention_keypoints):.4f}, {torch.max(grid_attention_keypoints):.4f}]")
+                        print(f"  - Spatial guidance range: [{torch.min(spatial_guidance):.4f}, {torch.max(spatial_guidance):.4f}]")
+                        if keypoint_guidance_mode == "enhanced":
+                            print(f"  - Enhanced keypoint regions: {torch.sum(keypoint_mask).item()} / {keypoint_mask.numel()} pixels")
+                        print(f"  - Output shape: {normal_attention_probs.shape} -> {guided_attention_probs.shape}")
+                        
+                        # Use guided attention to compute enhanced cross-attention output
+                        guided_hidden_states = torch.bmm(guided_attention_probs, normal_value)
+                        guided_hidden_states = attn.batch_to_head_dim(guided_hidden_states)
+                        
+                        # Apply final projection and return enhanced features
+                        guided_result = attn.to_out[0](guided_hidden_states)
+                        if len(attn.to_out) > 1:
+                            guided_result = attn.to_out[1](guided_result)
+                            
+                        # Return guided result directly instead of calling chained_proc
+                        if self.self_att and is_cfg_guidance:
+                            guided_result = torch.cat([res0, guided_result])
+                        return guided_result
+                    else:
+                        print(f"Dimension mismatch: spatial_seq={spatial_seq}, spatial_grid={spatial_grid}, text_tokens={text_tokens}, num_keypoints={num_keypoints}")
+                        print("Falling back to normal attention without keypoint guidance")'''
+                        
+            elif mode == 'm':
+                assert False, "Mode 'm' not supported yet"
+                encoder_hidden_states = torch.cat([encoder_hidden_states, cross_att_ref_dict[self.name]], dim=1)
+            else:
+                assert False, mode
+        res = self.chained_proc(attn, hidden_states, encoder_hidden_states, attention_mask)
+        
+        # Restore original attention function if it was modified for guided attention
+        if hasattr(attn, '_restore_attention_scores'):
+            attn.get_attention_scores = attn._restore_attention_scores
+            delattr(attn, '_restore_attention_scores')
+        
+        if self.self_att and is_cfg_guidance:
+            res = torch.cat([res0, res])
+        return res
+
+
+class RefOnlyNoisedUNet(torch.nn.Module):
+    def __init__(self, unet: UNet2DConditionModel, train_sched: DDPMScheduler, val_sched: EulerAncestralDiscreteScheduler) -> None:
+        super().__init__()
+        self.unet = unet
+        self.train_sched = train_sched
+        self.val_sched = val_sched
+
+        unet_lora_attn_procs = dict()
+        for name, _ in unet.attn_processors.items():
+            if torch.__version__ >= '2.0':
+                default_attn_proc = AttnProcessor2_0()
+            elif is_xformers_available():
+                default_attn_proc = XFormersAttnProcessor()
+            else:
+                default_attn_proc = AttnProcessor()
+            unet_lora_attn_procs[name] = ReferenceOnlyAttnProc(
+                default_attn_proc, 
+                self_att=name.endswith("attn1.processor"), 
+                cross_att=name.endswith("attn2.processor"),
+                name=name
+            )
+        unet.set_attn_processor(unet_lora_attn_procs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.unet, name)
+
+    def forward_cond(self, noisy_cond_lat, timestep, encoder_hidden_states, class_labels, ref_dict, is_cfg_guidance, **kwargs):
+        """
+        Forward pass for condition image processing (Zero123Plus reference-only mechanism).
+        
+        Args:
+            noisy_cond_lat: Noisy condition latent
+            timestep: Diffusion timestep
+            encoder_hidden_states: Text encoder hidden states
+            class_labels: Class labels if any
+            ref_dict: Reference dictionary for storing condition features
+            is_cfg_guidance: Whether using classifier-free guidance
+        """
+        if is_cfg_guidance:
+            encoder_hidden_states = encoder_hidden_states[1:]
+            class_labels = class_labels[1:]
+        
+        # Run UNet forward pass to collect condition features in reference branch
+        self.unet(
+            noisy_cond_lat, timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            class_labels=class_labels,
+            cross_attention_kwargs=dict(mode="cw", ref_dict=ref_dict),
+            **kwargs
+        )
+        
+        
+
+    def forward_sk(self, noisy_target_imgs, timestep, encoder_hidden_states, cross_att_ref_dict, learnable_embeddings, **kwargs):
+        """
+        Forward pass for StableKeypoints processing on target images.
+        
+        Args:
+            noisy_target_imgs: Noisy target images tensor (batch_size * num_views, channels, height, width)
+            timestep: Diffusion timestep
+            encoder_hidden_states: Text encoder hidden states
+            ref_dict: Reference dictionary for storing attention maps
+            learnable_embeddings: Learnable embeddings for keypoint discovery
+        """
+        # Ensure timestep has correct shape for batch processing
+        if timestep.dim() == 0:  # scalar timestep
+            timestep = timestep.unsqueeze(0).expand(noisy_target_imgs.shape[0])
+        elif timestep.shape[0] == 1 and noisy_target_imgs.shape[0] > 1:
+            timestep = timestep.expand(noisy_target_imgs.shape[0])
+        
+        # Expand encoder_hidden_states for batch processing if needed
+        if encoder_hidden_states.shape[0] == 1 and noisy_target_imgs.shape[0] > 1:
+            encoder_hidden_states = encoder_hidden_states.expand(noisy_target_imgs.shape[0], -1, -1)
+        
+        # Expand learnable_embeddings for batch processing if needed
+        if learnable_embeddings is not None and learnable_embeddings.shape[0] == 1 and noisy_target_imgs.shape[0] > 1:
+            learnable_embeddings = learnable_embeddings.expand(noisy_target_imgs.shape[0], -1, -1)
+        
+        # Run UNet forward pass to collect attention maps in SK branch
+        self.unet(
+            noisy_target_imgs, timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            cross_attention_kwargs=dict(mode="skw", cross_att_ref_dict=cross_att_ref_dict, learnable_embeddings=learnable_embeddings),
+            **kwargs
+        )
+        
+        sk_losses = compute_stable_keypoints_losses(cross_att_ref_dict)
+
+        return sk_losses
+
+    def forward(
+        self, sample, timestep, encoder_hidden_states, class_labels=None,
+        *args, cross_attention_kwargs,
+        down_block_res_samples=None, mid_block_res_sample=None,
+        keypoint_guidance_strength=0.3,
+        **kwargs
+    ):
+        cond_lat = cross_attention_kwargs['cond_lat']
+        is_cfg_guidance = cross_attention_kwargs.get('is_cfg_guidance', False)
+        noise = torch.randn_like(cond_lat)
+        if self.training:
+            noisy_cond_lat = self.train_sched.add_noise(cond_lat, noise, timestep)
+            noisy_cond_lat = self.train_sched.scale_model_input(noisy_cond_lat, timestep)
+        else:
+            noisy_cond_lat = self.val_sched.add_noise(cond_lat, noise, timestep.reshape(-1))
+            noisy_cond_lat = self.val_sched.scale_model_input(noisy_cond_lat, timestep.reshape(-1))
+        ref_dict = {}
+        
+        
+        self.forward_cond(
+            noisy_cond_lat, timestep,
+            encoder_hidden_states, class_labels,
+            ref_dict, is_cfg_guidance, **kwargs
+        )
+
+        target_lat = cross_attention_kwargs['target_lat']
+
+        
+        batch_size, num_views, channels, height, width = target_lat.shape
+        target_lat = target_lat.view(batch_size * num_views, channels, height, width)
+        
+
+        noise = torch.randn_like(target_lat)
+        if self.training:
+            noisy_target_lat = self.train_sched.add_noise(target_lat, noise, timestep)
+            noisy_target_lat = self.train_sched.scale_model_input(noisy_target_lat, timestep)
+        else:
+            noisy_target_lat = self.val_sched.add_noise(target_lat, noise, timestep.reshape(-1))
+            noisy_target_lat = self.val_sched.scale_model_input(noisy_target_lat, timestep.reshape(-1))
+
+        # Get learnable embeddings if keypoint learning is enabled
+        learnable_embeddings = cross_attention_kwargs['learnable_embeddings']
+        cross_att_ref_dict = {}
+        sk_losses = self.forward_sk(
+            noisy_target_lat, timestep,
+            encoder_hidden_states, cross_att_ref_dict, learnable_embeddings, **kwargs
+        )
+        # Store SK losses in cross_attention_kwargs for later access
+        if 'ref_sk_loss' not in cross_attention_kwargs:
+            cross_attention_kwargs['ref_sk_loss'] = {}
+        cross_attention_kwargs['ref_sk_loss']['sk_losses'] = sk_losses
+
+        weight_dtype = self.unet.dtype
+        
+        # Pass SK losses through cross_attention_kwargs for training loop access
+        main_cross_kwargs = dict(mode="r", cross_att_ref_dict=cross_att_ref_dict, ref_dict=ref_dict, is_cfg_guidance=is_cfg_guidance,
+                               keypoint_guidance_strength=keypoint_guidance_strength,
+                               learnable_embeddings=learnable_embeddings)
+
+        return self.unet(
+            sample, timestep,
+            encoder_hidden_states, *args,
+            class_labels=class_labels,
+            cross_attention_kwargs=main_cross_kwargs,
+            down_block_additional_residuals=[
+                sample.to(dtype=weight_dtype) for sample in down_block_res_samples
+            ] if down_block_res_samples is not None else None,
+            mid_block_additional_residual=(
+                mid_block_res_sample.to(dtype=weight_dtype)
+                if mid_block_res_sample is not None else None
+            ),
+            **kwargs
+        )
+
+
+def scale_latents(latents):
+    latents = (latents - 0.22) * 0.75
+    return latents
+
+
+def unscale_latents(latents):
+    latents = latents / 0.75 + 0.22
+    return latents
+
+
+def scale_image(image):
+    image = image * 0.5 / 0.8
+    return image
+
+
+def unscale_image(image):
+    image = image / 0.5 * 0.8
+    return image
+
+
+class Zero123PlusPipeline(diffusers.StableDiffusionPipeline):
+    tokenizer: transformers.CLIPTokenizer
+    text_encoder: transformers.CLIPTextModel
+    vision_encoder: transformers.CLIPVisionModelWithProjection
+
+    feature_extractor_clip: transformers.CLIPImageProcessor
+    unet: UNet2DConditionModel
+    scheduler: diffusers.schedulers.KarrasDiffusionSchedulers
+
+    vae: AutoencoderKL
+    ramping: nn.Linear
+
+    feature_extractor_vae: transformers.CLIPImageProcessor
+    
+    # Learnable text embeddings for keypoint conditioning
+    learnable_embeddings: Optional[nn.Parameter]
+
+    def __init__(
+        self,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
+        unet: UNet2DConditionModel,
+        scheduler: KarrasDiffusionSchedulers,
+        vision_encoder: transformers.CLIPVisionModelWithProjection,
+        feature_extractor_clip: CLIPImageProcessor, 
+        feature_extractor_vae: CLIPImageProcessor,
+        ramping_coefficients: Optional[list] = None,
+        safety_checker=None,
+        # Learnable embedding parameters for StableKeypoints
+        num_learnable_tokens: int = 16,
+        learnable_embedding_dim: Optional[int] = None,
+        use_learnable_embeddings: bool = False,
+    ):
+        DiffusionPipeline.__init__(self)
+
+        self.register_modules(
+            vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
+            unet=unet, scheduler=scheduler, safety_checker=None,
+            vision_encoder=vision_encoder,
+            feature_extractor_clip=feature_extractor_clip,
+            feature_extractor_vae=feature_extractor_vae
+        )
+        self.register_to_config(ramping_coefficients=ramping_coefficients)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        
+        # Initialize learnable embeddings for StableKeypoints
+        self.use_learnable_embeddings = use_learnable_embeddings
+        self.num_learnable_tokens = num_learnable_tokens
+        
+        if use_learnable_embeddings:
+            # Use text encoder's hidden size if embedding dim not specified
+            embedding_dim = learnable_embedding_dim or text_encoder.config.hidden_size
+            # Initialize as nn.Parameter for direct optimization (similar to SK implementation)
+            self.learnable_embeddings = nn.Parameter(
+                torch.randn(1, num_learnable_tokens, embedding_dim) * 0.02
+            )
+        else:
+            self.learnable_embeddings = None
+
+    def prepare(self):
+        train_sched = DDPMScheduler.from_config(self.scheduler.config)
+        if isinstance(self.unet, UNet2DConditionModel):
+            self.unet = RefOnlyNoisedUNet(self.unet, train_sched, self.scheduler).eval()
+
+    def encode_condition_image(self, image: torch.Tensor):
+        image = self.vae.encode(image).latent_dist.sample()
+        return image
+    
+    def encode_target_images(self, target_images: torch.Tensor):
+        """
+        Encode target images for StableKeypoints processing.
+        
+        Args:
+            target_images: Target images tensor with shape (batch_size, num_views, channels, height, width)
+                          or (num_views, channels, height, width)
+                          
+        Returns:
+            Encoded target latents ready for batch processing
+        """
+        original_shape = target_images.shape
+        
+        if target_images.dim() == 5:  # (batch_size, num_views, channels, height, width)
+            batch_size, num_views, channels, height, width = target_images.shape
+            # Reshape for VAE encoding
+            target_images_flat = target_images.view(batch_size * num_views, channels, height, width)
+        elif target_images.dim() == 4:  # (num_views, channels, height, width)
+            num_views, channels, height, width = target_images.shape
+            batch_size = 1
+            target_images_flat = target_images
+        else:
+            raise ValueError(f"target_images must be 4D or 5D tensor, got {target_images.dim()}D")
+        
+        # Encode all target images in batch
+        target_latents = self.vae.encode(target_images_flat).latent_dist.sample()
+        
+        return target_latents  # Returns (batch_size * num_views, latent_channels, latent_height, latent_width)
+    
+    def get_learnable_embeddings(self, batch_size: int = 1, device: torch.device = None):
+        """
+        Get learnable embeddings for keypoint conditioning.
+        
+        Args:
+            batch_size: Number of batches to repeat embeddings for
+            device: Device to place embeddings on
+            
+        Returns:
+            Learnable embeddings tensor of shape [batch_size, num_learnable_tokens, embedding_dim]
+        """
+        
+            
+        device = device or self.learnable_embeddings.device
+        
+        # Expand for batch size
+        embeddings = self.learnable_embeddings.expand(batch_size, -1, -1)  # [batch_size, num_tokens, embedding_dim]
+        
+        return embeddings.to(device)
+    
+    def get_learnable_embedding_parameters(self):
+        """
+        Get parameters of learnable embeddings for training.
+        
+        Returns:
+            List of learnable embedding parameters, or empty list if not using learnable embeddings
+        """
+        if self.use_learnable_embeddings and self.learnable_embeddings is not None:
+            return [self.learnable_embeddings]
+        else:
+            return []
+    
+    def freeze_non_learnable_parameters(self):
+        """
+        Freeze all pipeline parameters except learnable embeddings.
+        Useful for fine-tuning only the learnable embeddings.
+        """
+        # Freeze all parameters first
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        # Unfreeze learnable embeddings if they exist
+        if self.use_learnable_embeddings and self.learnable_embeddings is not None:
+            self.learnable_embeddings.requires_grad = True
+    
+    def enable_keypoint_learning(self):
+        """
+        Enable keypoint learning mode for training.
+        This method should be called before starting keypoint optimization.
+        """
+        if not self.use_learnable_embeddings:
+            raise ValueError("Learnable embeddings are not enabled. Set use_learnable_embeddings=True during initialization.")
+        
+        # Enable training mode for UNet (the main trainable component)
+        #self.unet.train()
+        
+        # Freeze all parameters except learnable embeddings
+        #self.freeze_non_learnable_parameters()
+        
+        print(f"Keypoint learning enabled with {self.num_learnable_tokens} learnable tokens")
+    
+    def disable_keypoint_learning(self):
+        """
+        Disable keypoint learning mode and return to inference mode.
+        """
+        self.unet.eval()
+        print("Keypoint learning disabled - returned to inference mode")
+    
+    def get_keypoint_attention_maps(self, image: torch.Tensor, timestep: Optional[int] = None):
+        """
+        Extract attention maps for keypoint analysis during training.
+        
+        Args:
+            image: Input image tensor
+            timestep: Specific timestep for attention extraction (optional)
+            
+        Returns:
+            Dictionary of attention maps from cross-attention layers
+        """
+        # TODO: Implement keypoint attention map extraction
+        if not self.use_learnable_embeddings or self.learnable_embeddings is None:
+            raise ValueError("Learnable embeddings are not enabled")
+        
+        # Prepare inputs
+        cond_lat = self.encode_condition_image(image)
+        batch_size = cond_lat.shape[0]
+        learnable_embeds = self.get_learnable_embeddings(batch_size, image.device)
+        
+        # Create dummy encoder states (will be replaced by learnable embeddings in reference branch)
+        encoder_hidden_states = torch.zeros(batch_size, 77, self.text_encoder.config.hidden_size, 
+                                           device=image.device, dtype=image.dtype)
+        
+        # Use specific timestep or random one
+        if timestep is None:
+            timestep = torch.randint(0, 1000, (batch_size,), device=image.device)
+        else:
+            timestep = torch.full((batch_size,), timestep, device=image.device)
+        
+        # Add noise to condition latent
+        noise = torch.randn_like(cond_lat)
+        if self.training:
+            noisy_cond_lat = self.unet.train_sched.add_noise(cond_lat, noise, timestep)
+        else:
+            noisy_cond_lat = self.unet.val_sched.add_noise(cond_lat, noise, timestep)
+        
+        # Run reference branch to collect attention maps
+        ref_dict = {}
+        self.unet.forward_cond(
+            noisy_cond_lat, timestep, encoder_hidden_states, None,
+            ref_dict, False, learnable_embeds
+        )
+        
+        return ref_dict
+    
+    def train_step_with_sk_losses(self, batch, optimizer, loss_weights=None):
+        """
+        Training step that includes both NVS and StableKeypoints losses.
+        
+        Args:
+            batch: Training batch containing images and other data
+            optimizer: Optimizer for learnable embeddings
+            loss_weights: Dictionary of loss weights for different components
+            
+        Returns:
+            Dictionary containing all loss components
+        """
+        if loss_weights is None:
+            loss_weights = {
+                'localization': 1.0,
+                'equivariance': 0.1,
+                'nvs': 1.0  # NVS loss weight
+            }
+        
+        # Enable gradient computation for learnable embeddings
+        if not self.use_learnable_embeddings or self.learnable_embeddings is None:
+            raise ValueError("Learnable embeddings must be enabled for training")
+        
+        # Prepare inputs
+        images = batch['images']  # Assumes batch contains images
+        
+        # Encode condition images
+        with torch.no_grad():
+            cond_lat = self.encode_condition_image(images)
+            # Add other preprocessing as needed for your NVS pipeline
+        
+        # Forward pass with SK losses
+        batch_size = cond_lat.shape[0]
+        learnable_embeds = self.get_learnable_embeddings(batch_size, images.device)
+        
+        # Create dummy encoder states (will be replaced by learnable embeddings in reference branch)
+        encoder_hidden_states = torch.zeros(batch_size, 77, self.text_encoder.config.hidden_size, 
+                                           device=images.device, dtype=images.dtype)
+        
+        # Random timestep
+        timestep = torch.randint(0, 1000, (batch_size,), device=images.device)
+        
+        # Add noise
+        noise = torch.randn_like(cond_lat)
+        if self.training:
+            noisy_cond_lat = self.unet.train_sched.add_noise(cond_lat, noise, timestep)
+            noisy_cond_lat = self.unet.train_sched.scale_model_input(noisy_cond_lat, timestep)
+        else:
+            noisy_cond_lat = self.unet.val_sched.add_noise(cond_lat, noise, timestep)
+            noisy_cond_lat = self.unet.val_sched.scale_model_input(noisy_cond_lat, timestep)
+        
+        # Forward pass through UNet with SK loss computation
+        ref_dict = {}
+        
+        # Reference branch: collect attention maps and compute SK losses
+        self.unet.forward_cond(
+            noisy_cond_lat, timestep, encoder_hidden_states, None,
+            ref_dict, False, learnable_embeds
+        )
+        
+        # Main branch: compute NVS loss (normal diffusion loss)
+        with torch.no_grad():
+            # For NVS loss, you might want to compute standard diffusion loss
+            # This depends on your specific NVS training setup
+            nvs_output = self.unet(
+                noisy_cond_lat, timestep, encoder_hidden_states,
+                cross_attention_kwargs=dict(mode="r", ref_dict=ref_dict.copy(), is_cfg_guidance=False)
+            )
+            # Compute NVS loss (e.g., MSE between predicted and actual noise)
+            nvs_loss = torch.nn.functional.mse_loss(nvs_output.sample, noise)
+        
+        # Extract SK losses
+        sk_losses = ref_dict['sk_losses']
+        #total_sk_loss = ref_dict.get('total_sk_loss', 0.0)
+        
+        # Combine losses
+        total_loss = (
+            loss_weights['localization'] * sk_losses.get('total_localization', 0.0) +
+            loss_weights['equivariance'] * sk_losses.get('total_equivariance', 0.0) +
+            loss_weights['nvs'] * nvs_loss
+        )
+        
+        # Backward pass (only updates learnable embeddings)
+        total_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        # Return all loss components for logging
+        return {
+            'total_loss': total_loss.item(),
+            'nvs_loss': nvs_loss.item(),
+            'sk_total_loss': sum(sk_losses.values()),
+            'localization_loss': sk_losses.get('localization', 0.0),
+            'equivariance_loss': sk_losses.get('equivariance', 0.0),
+            **{k: v.item() if isinstance(v, torch.Tensor) else v for k, v in sk_losses.items()}
+        }
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        image: Image.Image = None,
+        prompt = "",
+        *args,
+        num_images_per_prompt: Optional[int] = 1,
+        guidance_scale=4.0,
+        output_type: Optional[str] = "pil",
+        width=640,
+        height=960,
+        num_inference_steps=28,
+        return_dict=True,
+        use_learnable_embeddings_inference: bool = None,
+        keypoint_guidance_strength: float = 0.3,
+        **kwargs
+    ):
+        self.prepare()
+        
+        if image is None:
+            raise ValueError("Inputting embeddings not supported for this pipeline. Please pass an image.")
+        assert not isinstance(image, torch.Tensor)
+        image = to_rgb_image(image)
+        image_1 = self.feature_extractor_vae(images=image, return_tensors="pt").pixel_values
+        image_2 = self.feature_extractor_clip(images=image, return_tensors="pt").pixel_values
+        image = image_1.to(device=self.vae.device, dtype=self.vae.dtype)
+        image_2 = image_2.to(device=self.vae.device, dtype=self.vae.dtype)
+        cond_lat = self.encode_condition_image(image)
+        if guidance_scale > 1:
+            negative_lat = self.encode_condition_image(torch.zeros_like(image))
+            cond_lat = torch.cat([negative_lat, cond_lat])
+        encoded = self.vision_encoder(image_2, output_hidden_states=False)
+        global_embeds = encoded.image_embeds
+        global_embeds = global_embeds.unsqueeze(-2)
+        
+        if hasattr(self, "encode_prompt"):
+            encoder_hidden_states = self.encode_prompt(
+                prompt,
+                self.device,
+                1, #num_images_per_prompt,
+                False
+            )[0]
+        else:
+            encoder_hidden_states = self._encode_prompt(
+                prompt,
+                self.device,
+                1, #num_images_per_prompt,
+                False
+            )
+        
+        '''# Integrate learnable embeddings if enabled
+        use_learnable = use_learnable_embeddings_inference
+        if use_learnable is None:
+            use_learnable = self.use_learnable_embeddings
+            
+        if use_learnable and self.learnable_embeddings is not None:
+            # Get learnable embeddings for the current batch
+            batch_size = encoder_hidden_states.shape[0]
+            learnable_embeds = self.get_learnable_embeddings(
+                batch_size=batch_size, 
+                device=encoder_hidden_states.device
+            )
+            
+            # Combine with text embeddings
+            encoder_hidden_states = self.combine_embeddings_with_text(
+                encoder_hidden_states, 
+                learnable_embeds
+            )'''
+        
+        ramp = global_embeds.new_tensor(self.config.ramping_coefficients).unsqueeze(-1)
+        encoder_hidden_states = encoder_hidden_states + global_embeds * ramp
+
+        if num_images_per_prompt > 1:
+            bs_embed, *lat_shape = cond_lat.shape
+            assert len(lat_shape) == 3
+            cond_lat = cond_lat.repeat(1, num_images_per_prompt, 1, 1)
+            cond_lat = cond_lat.view(bs_embed * num_images_per_prompt, *lat_shape)
+
+        cak = dict(cond_lat=cond_lat, keypoint_guidance_strength=keypoint_guidance_strength)
+        
+        # Add learnable embeddings to cross_attention_kwargs if keypoint learning is enabled
+        if self.use_learnable_embeddings and self.learnable_embeddings is not None:
+            # During inference, we can optionally use learnable embeddings
+            use_learnable = use_learnable_embeddings_inference
+            if use_learnable is None:
+                use_learnable = self.training  # Use learnable embeddings only during training by default
+                
+            if use_learnable:
+                batch_size = encoder_hidden_states.shape[0]
+                learnable_embeds = self.get_learnable_embeddings(batch_size, encoder_hidden_states.device)
+                cak['learnable_embeddings'] = learnable_embeds
+                print(f"Using learnable embeddings for keypoint attention: {learnable_embeds.shape}")
+        
+        latents: torch.Tensor = super().__call__(
+            None,
+            *args,
+            cross_attention_kwargs=cak,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            prompt_embeds=encoder_hidden_states,
+            num_inference_steps=num_inference_steps,
+            output_type='latent',
+            width=width,
+            height=height,
+            **kwargs
+        ).images
+        latents = unscale_latents(latents)
+        if not output_type == "latent":
+            image = unscale_image(self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0])
+        else:
+            image = latents
+
+        image = self.image_processor.postprocess(image, output_type=output_type)
+        if not return_dict:
+            return (image,)
+
+        return ImagePipelineOutput(images=image)
