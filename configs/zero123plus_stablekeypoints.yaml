@@ -1,0 +1,63 @@
+# Zero123Plus + StableKeypoints Training Configuration
+
+model:
+  model_id: "sudo-ai/zero123plus-v1.2"
+  num_probes: 20
+  dtype: "float16" # float16 for GPU, float32 for CPU
+
+training:
+  learning_rate: 1e-4
+  num_epochs: 10
+  batch_size: 1 # Small batch size for Zero123Plus
+  gradient_accumulation_steps: 4
+  num_workers: 2
+  max_samples: null # Use all available samples
+
+  # Loss weights
+  compactness_weight: 1.0
+  diversity_weight: 0.5
+
+  # Regularization
+  weight_decay: 1e-5
+
+inference:
+  num_inference_steps: 20
+  guidance_scale: 3.0
+  temperature: 1.0 # For soft-argmax keypoint extraction
+
+data:
+  image_size: [256, 256]
+  normalization:
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+logging:
+  log_every: 10
+  save_every: 100
+  output_dir: "runs"
+  wandb_project: null # Set to enable wandb logging
+
+visualization:
+  visualize_keypoints: true
+  save_attention_maps: true
+  keypoint_radius: 5
+  max_attention_maps: 10
+
+hardware:
+  device: "auto" # auto, cuda, cpu
+  pin_memory: true
+
+# Advanced settings
+advanced:
+  # Attention processor settings
+  collect_attention: true
+
+  # Cross-attention layer filtering (optional)
+  # If specified, only these layers will be processed
+  target_layers: null # e.g., ["attn2", "cross_attn"]
+
+  # Probe injection strategy
+  probe_injection: "append" # append, prepend, interpolate
+
+  # Attention aggregation
+  aggregation_method: "mean" # mean, max, weighted_mean
