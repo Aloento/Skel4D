@@ -19,7 +19,7 @@ import json
 import wandb
 from typing import Optional
 
-from src.models.zero123plus_stablekeypoints import Zero123PlusStableKeypoints
+from zero123plus_stablekeypoints import Zero123PlusStableKeypoints
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)

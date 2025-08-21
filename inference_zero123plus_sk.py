@@ -14,7 +14,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import json
 
-from src.models.zero123plus_stablekeypoints import Zero123PlusStableKeypoints
+from zero123plus_stablekeypoints import Zero123PlusStableKeypoints
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

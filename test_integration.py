@@ -10,7 +10,7 @@ from pathlib import Path
 # 添加项目路径
 sys.path.append(str(Path(__file__).parent))
 
-from src.models.zero123plus_stablekeypoints import Zero123PlusStableKeypoints
+from zero123plus_stablekeypoints import Zero123PlusStableKeypoints
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
